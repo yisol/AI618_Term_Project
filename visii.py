@@ -809,6 +809,8 @@ class StableDiffusionVisii(DiffusionPipeline):
         eval_step: int=200,
         clip_loss: bool = True,
         log_dir: str = './logs',
+        train_dataloader=None,
+        num_train_epochs=20,
         **kwargs,
     ):
         accelerator = Accelerator(
@@ -862,19 +864,12 @@ class StableDiffusionVisii(DiffusionPipeline):
 
         target_list = target_images
         cond_list = cond_images
-        list_target_image_latents = []
-        list_cond_image_latents = []
 
         for i in range(len(cond_list)):
             target_image = preprocess(target_list[i])
             cond_image = preprocess(cond_list[i])
             latents_dtype = prompt_embeds.dtype
             height, width = cond_image.shape[-2:]
-            cond_image_latents = self.prepare_image_latents(cond_image, batch_size, num_images_per_prompt, prompt_embeds.dtype, device, do_classifier_free_guidance, generator,)
-            target_image_latents = self.prepare_target_latents(target_image, prompt_embeds.dtype, device,)
-            target_image_latents = 0.18215 * target_image_latents
-            list_target_image_latents.append(target_image_latents)
-            list_cond_image_latents.append(cond_image_latents)
         # 6. Prepare latent variables
         num_channels_latents = self.vae.config.latent_channels
         latents = self.prepare_latents(batch_size * num_images_per_prompt, num_channels_latents, height, width, prompt_embeds.dtype, device, generator, latents,)
@@ -897,65 +892,73 @@ class StableDiffusionVisii(DiffusionPipeline):
         random.shuffle(total_index)
         print(f'Train with {num_img} pair(s)')
 
-        for index in tqdm(total_index):
-            with accelerator.accumulate(prompt_embeds):
-                optimizer.zero_grad()
-                noise = noises[index]
-                target_image_latents = list_target_image_latents[index%num_img]
-                cond_image_latents = list_cond_image_latents[index%num_img]
+        for epoch in range(num_train_epochs):
+            for step, batch in enumerate(train_dataloader):
+                with accelerator.accumulate(prompt_embeds):
+                    optimizer.zero_grad()
+                    target_image = batch["after"]
+                    noise = torch.randn(target_image_latents.shape).to(target_image_latents.device)
+                    target_image_latents = self.prepare_target_latents(target_image, prompt_embeds.dtype, device,)
+                    target_image_latents = 0.18215 * target_image_latents
 
-                timesteps = torch.Tensor([index]).to(device=target_image_latents.device)
-                noisy_latents = self.scheduler.add_noise(target_image_latents, noise, timesteps)
+                    cond_image = batch["before"]
+                    cond_image_latents = self.prepare_image_latents(cond_image, batch_size, num_images_per_prompt, prompt_embeds.dtype, device, do_classifier_free_guidance, generator,)
 
-                latent_model_input = torch.cat([noisy_latents] * 3) if do_classifier_free_guidance else noisy_latents
-                scaled_latent_model_input = self.scheduler.scale_model_input(latent_model_input, timesteps)
-                scaled_latent_model_input = torch.cat([scaled_latent_model_input, cond_image_latents], dim=1)
-                # predict the noise residual
-                noise_pred = self.unet(scaled_latent_model_input, timesteps,
-                                encoder_hidden_states=prompt_embeds).sample
 
-                if do_classifier_free_guidance:
-                    noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
-                    noise_pred = (
-                        noise_pred_uncond
-                        + guidance_scale * (noise_pred_text - noise_pred_image)
-                        + image_guidance_scale * (noise_pred_image - noise_pred_uncond)
-                    )
+                    timesteps = torch.randint(0, self.scheduler.num_train_timesteps, (target_image_latents.shape[0],), device=latents.device)
+                    timesteps = timesteps.long()
 
-                loss_mse = criterion_mse(noise_pred.float(), noise.float())
-                loss = loss_mse*lambda_mse
-                if clip_loss:
-                    mean_prompt_embed = prompt_embeds[0].mean(0, keepdim=True)
-                    text_embeds = text_projection(mean_prompt_embed)
-                    text_embeds = text_embeds/text_embeds.norm(p=2, dim=-1, keepdim=True)
+                    noisy_latents = self.scheduler.add_noise(target_image_latents, noise, timesteps)
 
-                    loss_clip = criterion_cosine(edit_direction_embed, text_embeds)
-                    loss_clip = torch.clamp(loss_clip, min=-1, max=0.5)
-                    loss = loss - lambda_clip*loss_clip #+ 0.0001*torch.norm(prompt_embeds)
+                    latent_model_input = torch.cat([noisy_latents] * 3) if do_classifier_free_guidance else noisy_latents
+                    scaled_latent_model_input = self.scheduler.scale_model_input(latent_model_input, timesteps)
+                    scaled_latent_model_input = torch.cat([scaled_latent_model_input, cond_image_latents], dim=1)
+                    # predict the noise residual
+                    noise_pred = self.unet(scaled_latent_model_input, timesteps,
+                                    encoder_hidden_states=prompt_embeds).sample
 
-                accelerator.backward(loss)
-                torch.nn.utils.clip_grad_value_(prompt_embeds, prompt_embeds_orig.max())
-                optimizer.step()
-                optimizer.zero_grad()
-                    
-            with torch.no_grad():
-                prompt_embeds[1:] = prompt_embeds_orig[1:]
-                prompt_embeds[0][0] = prompt_embeds_orig[0][0] # <start> token
-                prompt_embeds[0][eos_location:] = prompt_embeds_orig[0][eos_location:] # <end> token
+                    if do_classifier_free_guidance:
+                        noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
+                        noise_pred = (
+                            noise_pred_uncond
+                            + guidance_scale * (noise_pred_text - noise_pred_image)
+                            + image_guidance_scale * (noise_pred_image - noise_pred_uncond)
+                        )
 
-            current_universal = loss_mse.detach().item()
-            # if apply_2_times:
-            #     current_universal += loss_mse_B.detach().item()
-            if universal_mse >= current_universal:
-                universal_mse = current_universal
-                print('New best checkpoint: ', os.path.join(log_dir, exp_name, 'prompt_embeds_best.pt'))
-                torch.save(prompt_embeds, os.path.join(log_dir, exp_name, 'prompt_embeds_best.pt'))
+                    loss_mse = criterion_mse(noise_pred.float(), noise.float())
+                    loss = loss_mse*lambda_mse
+                    if clip_loss:
+                        mean_prompt_embed = prompt_embeds[0].mean(0, keepdim=True)
+                        text_embeds = text_projection(mean_prompt_embed)
+                        text_embeds = text_embeds/text_embeds.norm(p=2, dim=-1, keepdim=True)
 
-            if total_step%eval_step==0:
-                os.makedirs(os.path.join(log_dir, exp_name), exist_ok=True)
-                print('Save to ', os.path.join(log_dir, exp_name, f'prompt_embeds_{total_step}.pt'))
-                torch.save(prompt_embeds, os.path.join(log_dir, exp_name, f'prompt_embeds_{total_step}.pt'))
-            total_step+=1
+                        loss_clip = criterion_cosine(edit_direction_embed, text_embeds)
+                        loss_clip = torch.clamp(loss_clip, min=-1, max=0.5)
+                        loss = loss - lambda_clip*loss_clip #+ 0.0001*torch.norm(prompt_embeds)
+
+                    accelerator.backward(loss)
+                    torch.nn.utils.clip_grad_value_(prompt_embeds, prompt_embeds_orig.max())
+                    optimizer.step()
+                    optimizer.zero_grad()
+                        
+                with torch.no_grad():
+                    prompt_embeds[1:] = prompt_embeds_orig[1:]
+                    prompt_embeds[0][0] = prompt_embeds_orig[0][0] # <start> token
+                    prompt_embeds[0][eos_location:] = prompt_embeds_orig[0][eos_location:] # <end> token
+
+                current_universal = loss_mse.detach().item()
+                # if apply_2_times:
+                #     current_universal += loss_mse_B.detach().item()
+                if universal_mse >= current_universal:
+                    universal_mse = current_universal
+                    print('New best checkpoint: ', os.path.join(log_dir, exp_name, 'prompt_embeds_best.pt'))
+                    torch.save(prompt_embeds, os.path.join(log_dir, exp_name, 'prompt_embeds_best.pt'))
+
+                if total_step%eval_step==0:
+                    os.makedirs(os.path.join(log_dir, exp_name), exist_ok=True)
+                    print('Save to ', os.path.join(log_dir, exp_name, f'prompt_embeds_{total_step}.pt'))
+                    torch.save(prompt_embeds, os.path.join(log_dir, exp_name, f'prompt_embeds_{total_step}.pt'))
+                total_step+=1
         prompt_embeds.requires_grad_(False)
         return prompt_embeds
 

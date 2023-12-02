@@ -11,9 +11,75 @@ import requests
 import torch
 import yaml
 from diffusers import EulerAncestralDiscreteScheduler
-from PIL import Image
+from PIL import Image, ImageDraw
 from tqdm import tqdm
 from visii import StableDiffusionVisii
+import torch.utils.data as data
+import pandas as pd
+
+
+
+class ODDataset(data.Dataset):
+    def __init__(self,
+                 phase
+                 ):
+
+        super(ODDataset, self).__init__()
+
+        
+        self.data_root = '/home/omnious/workspace/yisol/AI618_Term_Project/data'
+        self.phase = phase
+
+
+        json_file_name = '/home/omnious/workspace/yisol/AI618_Term_Project/data/train_solution_bounding_boxes.csv'
+        self.df = pd.read_csv(json_file_name)
+
+
+        if self.phase == 'train':
+            self.img_dir = os.path.join(self.data_root,'training_images')
+        else:
+            self.img_dir = os.path.join(self.data_root,'testing_images')
+        self.img_list = os.listdir(self.img_dir)
+
+
+    def draw_bbox(self,image, point1, point2):
+        draw = ImageDraw.Draw(image)
+        draw.rectangle([point1, point2], outline=(0, 255, 0), width=2)
+        return image
+
+    def __getitem__(self, index):
+
+        result_image = self.df.loc[index, 'image']
+
+        result ={}
+        
+        result["before"] = Image.open(os.path.join(self.img_dir,result_image)).convert('RGB')
+        # get bbox info.
+        x = self.df.loc[index, 'xmin']
+        y = self.df.loc[index, 'ymin']
+        width = self.df.loc[index, 'xmax'] - self.df.loc[index, 'xmin']
+        height = self.df.loc[index, 'ymax']-self.df.loc[index, 'ymin']
+        
+        x0 = x - width / 2
+        x1 = x + width / 2
+        y0 = y - height / 2
+        y1 = y + height / 2
+        start_point = (int(x0), int(y0))
+        end_point = (int(x1), int(y1))
+        
+        # draw bbox
+        result["after"] = self.draw_bbox(result["before"].copy(), start_point, end_point)
+
+        result['before'].save('before.jpg')
+        result['after'].save('after.jpg')
+        return result
+    
+
+
+    def __len__(self):
+        return len(self.df)
+
+
 
 
 def get_parser():
@@ -26,6 +92,7 @@ def get_parser():
     parser.add_argument('--embedding_learning_rate', type=float, default=None)
     parser.add_argument('--image_folder', type=str, default=None)
     parser.add_argument('--log_dir', type=str, default='./logs')
+    parser.add_argument('--train_batch_size', type=int, default=4)
     return parser.parse_args()
 
 
@@ -48,6 +115,21 @@ if __name__ == "__main__":
     subfolders = os.listdir(config['data']['image_folder'])
     subfolders = [x for x in subfolders if config['data']['subfolder'] in x]
     print('Train with subfolders: ', subfolders)
+
+    train_dataset = ODDataset(phase='train')
+
+
+
+
+    train_dataloader = torch.utils.data.DataLoader(
+            train_dataset,
+            pin_memory=True,
+            shuffle=False,
+            batch_size=args.train_batch_size,
+            num_workers=1,
+    )
+    for step, batch in enumerate(train_dataloader):
+        pass
 
     for folder in subfolders:
         current_folder = os.path.join(config['data']['image_folder'], folder)
@@ -94,6 +176,8 @@ if __name__ == "__main__":
         pipe = StableDiffusionVisii.from_pretrained(model_id,
             torch_dtype=torch.float32).to("cuda")
 
+        epoch = 20
+
         pipe.train(
             prompt=prompt,
             prompt_embeds=None,
@@ -107,6 +191,8 @@ if __name__ == "__main__":
             lambda_mse=config['hyperparams']['lambda_mse'],
             eval_step = config['hyperparams']['eval_step'],
             log_dir=args.log_dir,
+            train_dataloader=train_dataloader,
+            num_train_epochs = epoch,
             )
 
         if config['exp']['eval']:
